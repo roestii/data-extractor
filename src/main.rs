@@ -1,6 +1,8 @@
+use std::time::Duration;
 use std::{fs::File, collections::HashMap};
 use std::io::prelude::*;
 
+use clap::Parser;
 use serde_json::json;
 use tokio::sync::mpsc::{self, Sender};
 
@@ -9,29 +11,47 @@ use anyhow::Result;
 use serde::{Serialize, Deserialize};
 use dotenv::dotenv;
 
+#[derive(Parser)]
+struct Args {
+    #[clap(short, long)]
+    query: String,
+
+    #[clap(short, long, default_value_t = String::from("twitter_data.jsonl"))]
+    output_file: String,
+
+    #[clap(short, long, default_value_t = String::from("2020-03-05T00:00:00Z"))]
+    start_date: String,
+
+    #[clap(short, long, default_value_t = String::from("2022-03-05T00:00:00Z"))]
+    end_date: String,
+
+    #[clap(short, long, default_value_t = 4000)]
+    results: u32,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv()?;
 
+    let Args { query, output_file, start_date, end_date, results }  = Args::parse();
+
     let token = std::env::var("BEARER_TOKEN")?;
-    let query = "(neubau OR tower OR baumarkt OR sanierung OR hochhaus OR mehrfamilienhaus OR hochhausbau OR möbelhaus OR showroom OR skyscraper OR mehrfamilienhäuser OR wolkenkratzer OR warenhaus OR baumesse OR küchenverkauf OR (bad studio) OR baugeschäft OR möbelhandel OR neubauviertel) lang:de -is:retweet";
+    //let _old_query = "(neubau OR tower OR baumarkt OR sanierung OR hochhaus OR mehrfamilienhaus OR hochhausbau OR möbelhaus OR showroom OR skyscraper OR mehrfamilienhäuser OR wolkenkratzer OR warenhaus OR baumesse OR küchenverkauf OR (bad studio) OR baugeschäft OR möbelhandel OR neubauviertel) lang:de -is:retweet";
+    //let query = "(((küchen studio) OR hochhaus) (neu OR insolvenz OR eröffnung)) lang:de -is:retweet";
     let fields = "author_id,created_at";
-    let results = 4300;
 
-    let (tx, mut rx) = mpsc::channel(128);
-
-    tokio::spawn(async move {
-        match search_tweets(tx, query, results, fields, &token).await {
-            Err(e) => eprintln!("{:?}", e),
-            _ => eprintln!("Send the tweets out"),
-        }
-    });
-
-    let file_path = format!("../complete/twitter_data.json");
-    let to_file_path = format!("../text_only/twitter_data.json");
-
+    let file_path = format!("../complete/{}", output_file);
+    let to_file_path = format!("../text_only/{}", output_file);
     File::create(&file_path)?;
     File::create(&to_file_path)?;
+
+    search_tweets(&query, results, fields, &token, &start_date, &end_date, &output_file).await;
+    Ok(())
+}
+
+fn append_to_file(content: Vec<Tweet>, output_file: &str) -> std::io::Result<()> {
+    let file_path = format!("../complete/{}", output_file);
+    let to_file_path = format!("../text_only/{}", output_file);
 
     let mut file = File::options()
         .append(true)
@@ -41,7 +61,7 @@ async fn main() -> Result<()> {
         .append(true)
         .open(to_file_path)?;
 
-    while let Some(tweet) = rx.recv().await {
+    for tweet in content {
         writeln!(file, "{}", serde_json::to_string(&tweet)?)?;
 
         let text_only = json!({
@@ -54,12 +74,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn search_tweets(tx: Sender<Tweet>, query: &str, results: u32, fields: &str, token: &str) -> Result<()> {
+async fn search_tweets(
+    query: &str, 
+    results: u32,
+    fields: &str,
+    token: &str,
+    start_time: &str,
+    end_time: &str,
+    output_file: &str
+) -> Result<()> {
     let client = Client::new();
     let url = "https://api.twitter.com/2/tweets/search/all";
 
     let mut params = HashMap::new();
     params.insert("query", query.to_string());
+    params.insert("start_time", start_time.to_string());
+    params.insert("end_time", end_time.to_string());
 
     if results > 500 {
         params.insert("max_results", 500.to_string());
@@ -68,7 +98,6 @@ async fn search_tweets(tx: Sender<Tweet>, query: &str, results: u32, fields: &st
     }
 
     params.insert("tweet.fields", fields.to_string());
-
     let mut next_token: Option<String> = None;
 
     for _ in 0..(results / 500) {
@@ -93,21 +122,23 @@ async fn search_tweets(tx: Sender<Tweet>, query: &str, results: u32, fields: &st
             .expect("to get something")
             .json()
             .await
-            .expect("valid json");
+            .expect("Valid JSON");
 
         let tweets = response.data.unwrap();
-        next_token = response.meta.unwrap().next_token;
+        append_to_file(tweets, output_file)?;
 
-        for tweet in tweets {
-            tx.send(tweet)
-                .await
-                .expect("working rx");
-        }
+        next_token = match response.meta.unwrap().next_token {
+            Some(next_token) => Some(next_token),
+            None => break,
+        };
+
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     let remainder = results % 500;
 
-    if remainder > 0 {
+    if remainder > 0 && !next_token.is_none() {
         let value = params.get_mut("max_results").unwrap();
         *value = remainder.to_string();
 
@@ -122,24 +153,19 @@ async fn search_tweets(tx: Sender<Tweet>, query: &str, results: u32, fields: &st
             .expect("valid json");
 
         let tweets = response.data.unwrap();
-
-        for tweet in tweets {
-            tx.send(tweet)
-                .await
-                .expect("working rx");
-        }
+        append_to_file(tweets, output_file)?;
     }
 
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Data<T> {
     data: Option<T>,
     meta: Option<Meta>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Meta {
     newest_id: Option<String>,
     oldest_id: Option<String>,
